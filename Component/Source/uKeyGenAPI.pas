@@ -33,6 +33,7 @@ type
     FCreatedStr: string;
     FUpdatedStr: string;
     FLicensee: string;
+    FMetaData: string;
     function GetExpirationDT: TDateTime;
     procedure SetExpirationDT(const Value: TDateTime);
     function GetStatus: TKeyGenLicenseStatus;
@@ -81,6 +82,7 @@ type
     property Created: TDateTime read GetCreatedDT write SetCreatedDT;
     property UpdatedStr: string read FUpdatedStr write FUpdatedStr;
     property Updated: TDateTime read GetUpdatedDT write SetUpdatedDT;
+    property MetaData: string read FMetaData write FMetaData;
   end;
 
   TKeyGenLicenses = TList<TKeyGenLicense>;
@@ -101,10 +103,10 @@ type
     // the licenses
     FKeyGenLicenses: TKeyGenLicenses;
 
-    FMetaDataObj: TJSONValue;
+    FUserToken: string;
     procedure SetAccountID(const Value: string);
     procedure SetAccountIDRequestParam(ARESTRequest: TRESTRequest);
-    procedure SetIntRequestParam(ARESTRequest: TRESTRequest; const ParamName: string; const ParamValue: Integer);
+    procedure SetAuthBearerRequestParam(ARESTRequest: TRESTRequest);
     procedure SetBodyRequestParam(ARESTRequest: TRESTRequest; const ABody: string);
   protected
     const
@@ -116,6 +118,7 @@ type
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
     // KeyGen API functions
+    function Ping: Boolean;
     function ListLicenses(const PageNum: Integer = 1; const Limit: Integer = 10): Boolean;
     function ValidateKey(const Key: string): Boolean;
     { TODO : add support for more functions later }
@@ -123,13 +126,14 @@ type
     property BaseURL: string read FBaseURL write FBaseURL;
     property AccountID: string read FAccountID write SetAccountID;
     property KeyGenLicenses: TKeyGenLicenses read FKeyGenLicenses write FKeyGenLicenses;
+    property UserToken: string read FUserToken write FUserToken;
   end;
 
 
 implementation
 
 uses
-  System.DateUtils, System.StrUtils;
+  System.DateUtils, System.StrUtils, System.Math;
 
 { TKeyGenAPIClient }
 
@@ -173,9 +177,9 @@ begin
   ARESTRequest.Params.AddItem('ACCOUNT', FAccountID, TRESTRequestParameterKind.pkURLSEGMENT);
 end;
 
-procedure TKeyGenAPIClient.SetIntRequestParam(ARESTRequest: TRESTRequest; const ParamName: string; const ParamValue: Integer);
+procedure TKeyGenAPIClient.SetAuthBearerRequestParam(ARESTRequest: TRESTRequest);
 begin
-  ARESTRequest.Params.AddItem(ParamName, IntToStr(ParamValue), TRESTRequestParameterKind.pkURLSEGMENT);
+  ARESTRequest.Params.AddItem('Authorization', 'Bearer ' + FUserToken, TRESTRequestParameterKind.pkHTTPHEADER, [poDoNotEncode]);
 end;
 
 procedure TKeyGenAPIClient.SetBodyRequestParam(ARESTRequest: TRESTRequest; const ABody: string);
@@ -212,7 +216,6 @@ function TKeyGenAPIClient.FillNewLicenseFromJSON(const LicenseAttr: TJSONValue):
         "lastCheckIn": "2022-03-07T01:11:03.193Z",
         "nextCheckIn": "2022-03-14T01:11:03.193Z",
         "metadata": {
-          "storeName": "Monte's Monkey Sales",
           "rproClientId": 44223,
           "rproSiteCount": 50
         },
@@ -330,7 +333,7 @@ begin
     Result.ExpirationStr    := IfThen(LicenseAttr.P['expiry'].Null, EmptyStr, LicenseAttr.P['expiry'].Value);
     Result.CreatedStr       := IfThen(LicenseAttr.P['created'].Null, EmptyStr, LicenseAttr.P['created'].Value);
     Result.UpdatedStr       := IfThen(LicenseAttr.P['updated'].Null, EmptyStr, LicenseAttr.P['updated'].Value);
-    //FMetaDataObj      := LicenseAttr.P['metadata'];
+    Result.MetaData         := IfThen(LicenseAttr.P['metadata'].Null, EmptyStr, LicenseAttr.P['metadata'].Value);
   except
     on e:Exception do begin
       FLastError := 'PARSE_ERROR';
@@ -340,7 +343,8 @@ end;
 
 function TKeyGenAPIClient.ListLicenses(const PageNum: Integer = 1; const Limit: Integer = 10): Boolean;
 const
-  LIST_LICENSES_RESOURCE = 'accounts/{ACCOUNT}/licenses?limit={LIMIT}&page={PAGE}';
+  LIST_LICENSES_RESOURCE = 'accounts/{ACCOUNT}/licenses';
+  LIST_SUFFIX = '?limit=%d&page[size]=%d&page[number]=%d';
 var
   reqListLicenses: TRESTRequest;
   respListLicenses: TRESTResponse;
@@ -351,8 +355,6 @@ var
 begin
   Result := False;
 
-  FreeAndNil(FMetaDataObj);
-
   FKeyGenRestClient.BaseURL := FBaseURL;
 
   reqListLicenses := TRESTRequest.Create(Self);
@@ -361,13 +363,14 @@ begin
     reqListLicenses.AssignedValues := [TCustomRESTRequest.TAssignedValue.rvConnectTimeout,
                                        TCustomRESTRequest.TAssignedValue.rvReadTimeout];
     reqListLicenses.Client := FKeyGenRestClient;
-    reqListLicenses.Resource := LIST_LICENSES_RESOURCE;
-    reqListLicenses.Method := rmPOST;
+    reqListLicenses.Resource := LIST_LICENSES_RESOURCE +
+                                Format(LIST_SUFFIX, [Limit, Min(Limit, 100), Max(PageNum, 1)]);
+    reqListLicenses.Method := rmGET;
 
     respListLicenses := TRESTResponse.Create(nil);
     try
       respListLicenses.Name := 'respListLicenses';
-      respListLicenses.ContentType := 'application/json';
+      respListLicenses.ContentType := ctAPPLICATION_JSON;
 
       reqListLicenses.Response := respListLicenses;
 
@@ -376,9 +379,8 @@ begin
       if IsAccountIDSet then begin
         reqListLicenses.Params.Clear;
         SetAccountIDRequestParam(reqListLicenses);
-        SetIntRequestParam(reqListLicenses, 'LIMIT', Limit);
-        SetIntRequestParam(reqListLicenses, 'PAGE', PageNum);
-        reqListLicenses.Execute; /////////////////// get unauthorized ... ???
+        SetAuthBearerRequestParam(reqListLicenses);
+        reqListLicenses.Execute;
 
         FLastStatus := respListLicenses.StatusCode;
         FLastError := respListLicenses.StatusText;
@@ -388,12 +390,6 @@ begin
           FLastResponse := respListLicenses.Content;
 
           LStatusResponse := respListLicenses.JSONValue;
-
-          LMetaObj := LStatusResponse.P['meta'];
-          if not SameText(LMetaObj.P['valid'].Value, 'true') then begin
-            FLastError := 'INVALID LICENSE';
-            Result := False;
-          end;
 
           LDataArray := TJSONArray(LStatusResponse.P['data']);
           for var LDataItem in LDataArray do begin
@@ -411,6 +407,42 @@ begin
   end;
 end;
 
+function TKeyGenAPIClient.Ping: Boolean;
+const
+  PING_RESOURCE = 'ping';
+var
+  reqPing: TRESTRequest;
+  respPing: TRESTResponse;
+begin
+  FKeyGenRestClient.BaseURL := FBaseURL;
+
+  reqPing := TRESTRequest.Create(Self);
+  try
+    reqPing.Name := 'reqPing';
+    reqPing.Client := FKeyGenRestClient;
+    reqPing.Resource := PING_RESOURCE;
+    reqPing.Method := rmGET;
+
+    respPing := TRESTResponse.Create(nil);
+    try
+      respPing.Name := 'respPing';
+      respPing.ContentType := ctAPPLICATION_JSON;
+
+      reqPing.Response := respPing;
+      reqPing.Execute;
+
+      FLastStatus := respPing.StatusCode;
+      FLastError := respPing.StatusText;
+
+      Result := respPing.Status.SuccessOK_200;
+    finally
+      respPing.Free;
+    end;
+  finally
+    reqPing.Free;
+  end;
+end;
+
 function TKeyGenAPIClient.ValidateKey(const Key: string): Boolean;
 const
   VALIDATE_KEY_RESOURCE = 'accounts/{ACCOUNT}/licenses/actions/validate-key';
@@ -423,8 +455,6 @@ var
   LAttrObj: TJSONValue;
 begin
   Result := False;
-
-  FreeAndNil(FMetaDataObj);
 
   FKeyGenRestClient.BaseURL := FBaseURL;
 
@@ -440,7 +470,7 @@ begin
     respValidateLicenseKey := TRESTResponse.Create(nil);
     try
       respValidateLicenseKey.Name := 'respValidateLicenseKey';
-      respValidateLicenseKey.ContentType := 'application/json';
+      respValidateLicenseKey.ContentType := ctAPPLICATION_JSON;
 
       reqValidateLicenseKey.Response := respValidateLicenseKey;
 
